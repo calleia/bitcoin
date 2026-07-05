@@ -118,6 +118,10 @@ static constexpr int STALE_RELAY_AGE_LIMIT = 30 * 24 * 60 * 60;
 /// Age after which a block is considered historical for purposes of rate
 /// limiting block relay. Set to one week, denominated in seconds.
 static constexpr int HISTORICAL_BLOCK_AGE = 7 * 24 * 60 * 60;
+/** Maximum number of blocks simultaneously being fetched on behalf of peers in -proxymode */
+static constexpr size_t MAX_PROXY_BLOCK_REQUESTS{64};
+/** How long a peer's request for a proxied block stays pending before it expires */
+static constexpr auto PROXY_BLOCK_REQUEST_TIMEOUT{10min};
 /** Time between pings automatically sent out for latency probing and keepalive */
 static constexpr auto PING_INTERVAL{2min};
 /** The maximum number of entries in a locator */
@@ -521,7 +525,7 @@ public:
 
     /** Implement NetEventsInterface */
     void InitializeNode(const CNode& node, ServiceFlags our_services) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_tx_download_mutex);
-    void FinalizeNode(const CNode& node) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_headers_presync_mutex, !m_tx_download_mutex);
+    void FinalizeNode(const CNode& node) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_headers_presync_mutex, !m_tx_download_mutex, !m_proxy_requests_mutex);
     bool HasAllDesirableServiceFlags(ServiceFlags services) const override;
     bool ProcessMessages(CNode& node, std::atomic<bool>& interrupt) override
         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, !m_headers_presync_mutex, g_msgproc_mutex, !m_tx_download_mutex);
@@ -553,7 +557,7 @@ public:
 private:
     void ProcessMessage(Peer& peer, CNode& pfrom, const std::string& msg_type, DataStream& vRecv, NodeClock::time_point time_received,
                         const std::atomic<bool>& interruptMsgProc)
-        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, !m_headers_presync_mutex, g_msgproc_mutex, !m_tx_download_mutex);
+        EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, !m_headers_presync_mutex, g_msgproc_mutex, !m_tx_download_mutex, !m_proxy_requests_mutex);
 
     /** Consider evicting an outbound peer based on the amount of time they've been behind our tip */
     void ConsiderEviction(CNode& pto, Peer& peer, std::chrono::seconds time_in_seconds) EXCLUSIVE_LOCKS_REQUIRED(cs_main, g_msgproc_mutex);
@@ -867,6 +871,20 @@ private:
                                                 uint64_t network_key) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
 
 
+    /** A peer waiting for a block we are fetching on its behalf (-proxymode) */
+    struct ProxyBlockWaiter {
+        NodeId node_id;
+        //! Whether the peer requested the block with MSG_WITNESS_FLAG
+        bool want_witness;
+        //! When the request was received, for expiry
+        NodeClock::time_point time;
+    };
+    /** Guards m_proxy_block_requests */
+    Mutex m_proxy_requests_mutex;
+    /** Blocks we are fetching from the network on behalf of peers that
+     *  requested data we do not have (-proxymode), by block hash. */
+    std::map<uint256, std::vector<ProxyBlockWaiter>> m_proxy_block_requests GUARDED_BY(m_proxy_requests_mutex);
+
     // All of the following cache a recent block, and are protected by m_most_recent_block_mutex
     Mutex m_most_recent_block_mutex;
     std::shared_ptr<const CBlock> m_most_recent_block GUARDED_BY(m_most_recent_block_mutex);
@@ -967,7 +985,7 @@ private:
         EXCLUSIVE_LOCKS_REQUIRED(!m_most_recent_block_mutex, !tx_relay.m_tx_inventory_mutex);
 
     void ProcessGetData(CNode& pfrom, Peer& peer, const std::atomic<bool>& interruptMsgProc)
-        EXCLUSIVE_LOCKS_REQUIRED(!m_most_recent_block_mutex, peer.m_getdata_requests_mutex, NetEventsInterface::g_msgproc_mutex)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_most_recent_block_mutex, peer.m_getdata_requests_mutex, NetEventsInterface::g_msgproc_mutex, !m_proxy_requests_mutex, !m_peer_mutex)
         LOCKS_EXCLUDED(::cs_main);
 
     /** Process a new block. Perform any post-processing housekeeping */
@@ -1029,7 +1047,21 @@ private:
     bool BlockRequestAllowed(const CBlockIndex& block_index) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     bool AlreadyHaveBlock(const uint256& block_hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     void ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& inv)
-        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_most_recent_block_mutex);
+        EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex, !m_most_recent_block_mutex, !m_proxy_requests_mutex, !m_peer_mutex);
+
+    /**
+     * In -proxymode, handle a getdata block request from a peer for a block
+     * we know about but do not have the data for (e.g. because it was
+     * pruned): remember the requesting peer and fetch the block from another
+     * peer on the network. Once received, it is relayed back to all waiting
+     * peers (see ServeProxiedBlock).
+     */
+    void ProxyBlockRequest(const CNode& pfrom, const CInv& inv, const CBlockIndex& block_index)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_main, !m_proxy_requests_mutex, !m_peer_mutex);
+
+    /** In -proxymode, relay a block received from the network to all peers waiting on it. */
+    void ServeProxiedBlock(const uint256& hash, const std::shared_ptr<const CBlock>& pblock)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_proxy_requests_mutex);
 
     /**
      * Validation logic for compact filters request handling.
@@ -1740,6 +1772,19 @@ void PeerManagerImpl::FinalizeNode(const CNode& node)
         WITH_LOCK(m_tx_download_mutex, m_txdownloadman.CheckIsEmpty());
     }
     } // cs_main
+    {
+        // Forget proxied block requests from this peer (-proxymode).
+        LOCK(m_proxy_requests_mutex);
+        for (auto it = m_proxy_block_requests.begin(); it != m_proxy_block_requests.end();) {
+            auto& waiters = it->second;
+            std::erase_if(waiters, [&](const auto& waiter) { return waiter.node_id == nodeid; });
+            if (waiters.empty()) {
+                it = m_proxy_block_requests.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
     if (node.fSuccessfullyConnected &&
         !node.IsBlockOnlyConn() && !node.IsPrivateBroadcastConn() && !node.IsInboundConn()) {
         // Only change visible addrman state for full outbound peers.  We don't
@@ -2410,8 +2455,9 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& 
             return;
         }
         tip = m_chainman.ActiveChain().Tip();
-        // Avoid leaking prune-height by never sending blocks below the NODE_NETWORK_LIMITED threshold
-        if (!pfrom.HasPermission(NetPermissionFlags::NoBan) && (
+        // Avoid leaking prune-height by never sending blocks below the NODE_NETWORK_LIMITED threshold.
+        // In -proxymode there is no prune-height to leak: blocks we don't have are fetched and relayed.
+        if (!m_opts.proxy_mode && !pfrom.HasPermission(NetPermissionFlags::NoBan) && (
                 (((peer.m_our_services & NODE_NETWORK_LIMITED) == NODE_NETWORK_LIMITED) && ((peer.m_our_services & NODE_NETWORK) != NODE_NETWORK) && (tip->nHeight - pindex->nHeight > (int)NODE_NETWORK_LIMITED_MIN_BLOCKS + 2 /* add two blocks buffer extension for possible races */) )
            )) {
             LogDebug(BCLog::NET, "Ignore block request below NODE_NETWORK_LIMITED threshold, %s", pfrom.DisconnectMsg());
@@ -2422,6 +2468,9 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& 
         // Pruned nodes may have deleted the block, so check whether
         // it's available before trying to send.
         if (!(pindex->nStatus & BLOCK_HAVE_DATA)) {
+            if (m_opts.proxy_mode && (inv.IsMsgBlk() || inv.IsMsgWitnessBlk())) {
+                ProxyBlockRequest(pfrom, inv, *pindex);
+            }
             return;
         }
         can_direct_fetch = CanDirectFetch();
@@ -2518,6 +2567,108 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& 
             MakeAndPushMessage(pfrom, NetMsgType::INV, vInv);
             peer.m_continuation_block.SetNull();
         }
+    }
+}
+
+void PeerManagerImpl::ProxyBlockRequest(const CNode& pfrom, const CInv& inv, const CBlockIndex& block_index)
+{
+    AssertLockHeld(cs_main);
+
+    const auto now{NodeClock::now()};
+    bool start_fetch{false};
+    {
+        LOCK(m_proxy_requests_mutex);
+        // Expire requests whose block never arrived, so peers can retry and
+        // the map stays bounded.
+        for (auto it = m_proxy_block_requests.begin(); it != m_proxy_block_requests.end();) {
+            auto& waiters = it->second;
+            std::erase_if(waiters, [&](const auto& waiter) { return now - waiter.time > PROXY_BLOCK_REQUEST_TIMEOUT; });
+            if (waiters.empty()) {
+                it = m_proxy_block_requests.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        auto it = m_proxy_block_requests.find(inv.hash);
+        if (it == m_proxy_block_requests.end()) {
+            if (m_proxy_block_requests.size() >= MAX_PROXY_BLOCK_REQUESTS) {
+                LogDebug(BCLog::NET, "proxymode: too many pending proxied blocks, ignoring request for %s peer=%d\n", inv.hash.ToString(), pfrom.GetId());
+                return;
+            }
+            it = m_proxy_block_requests.try_emplace(inv.hash).first;
+            start_fetch = true;
+        }
+        auto& waiters = it->second;
+        const auto same_peer{std::find_if(waiters.begin(), waiters.end(), [&](const auto& waiter) { return waiter.node_id == pfrom.GetId(); })};
+        if (same_peer != waiters.end()) {
+            same_peer->want_witness = inv.IsMsgWitnessBlk();
+            same_peer->time = now;
+        } else {
+            waiters.push_back(ProxyBlockWaiter{pfrom.GetId(), inv.IsMsgWitnessBlk(), now});
+        }
+    }
+    // The block is already being fetched on behalf of an earlier request.
+    if (!start_fetch) return;
+
+    // Pick a random full-node peer other than the requester to fetch from.
+    std::vector<NodeId> candidates;
+    {
+        LOCK(m_peer_mutex);
+        for (const auto& [id, candidate] : m_peer_map) {
+            if (id == pfrom.GetId()) continue;
+            if (!CanServeWitnesses(*candidate)) continue;
+            if (!(candidate->m_their_services & NODE_NETWORK)) continue;
+            candidates.push_back(id);
+        }
+    }
+    if (!candidates.empty()) {
+        const NodeId fetch_from{candidates[m_rng.randrange(candidates.size())]};
+        const auto res{FetchBlock(fetch_from, block_index)};
+        if (res) {
+            LogDebug(BCLog::NET, "proxymode: fetching block %s from peer=%d on behalf of peer=%d\n", inv.hash.ToString(), fetch_from, pfrom.GetId());
+            return;
+        }
+        LogDebug(BCLog::NET, "proxymode: failed to fetch block %s for peer=%d: %s\n", inv.hash.ToString(), pfrom.GetId(), res.error());
+    } else {
+        LogDebug(BCLog::NET, "proxymode: no peer available to fetch block %s for peer=%d\n", inv.hash.ToString(), pfrom.GetId());
+    }
+    // The fetch was not started; forget the request so a later getdata can retry.
+    WITH_LOCK(m_proxy_requests_mutex, m_proxy_block_requests.erase(inv.hash));
+}
+
+void PeerManagerImpl::ServeProxiedBlock(const uint256& hash, const std::shared_ptr<const CBlock>& pblock)
+{
+    AssertLockNotHeld(m_proxy_requests_mutex);
+
+    std::vector<ProxyBlockWaiter> waiters;
+    {
+        LOCK(m_proxy_requests_mutex);
+        const auto it{m_proxy_block_requests.find(hash)};
+        if (it == m_proxy_block_requests.end()) return;
+        waiters = std::move(it->second);
+        m_proxy_block_requests.erase(it);
+    }
+
+    // Only relay the block if it was accepted and stored, i.e. it passed validation.
+    {
+        LOCK(cs_main);
+        const CBlockIndex* pindex{m_chainman.m_blockman.LookupBlockIndex(hash)};
+        if (!pindex || !(pindex->nStatus & BLOCK_HAVE_DATA)) {
+            LogDebug(BCLog::NET, "proxymode: not relaying block %s that was not accepted\n", hash.ToString());
+            return;
+        }
+    }
+
+    for (const auto& waiter : waiters) {
+        m_connman.ForNode(waiter.node_id, [&](CNode* node) {
+            if (waiter.want_witness) {
+                MakeAndPushMessage(*node, NetMsgType::BLOCK, TX_WITH_WITNESS(*pblock));
+            } else {
+                MakeAndPushMessage(*node, NetMsgType::BLOCK, TX_NO_WITNESS(*pblock));
+            }
+            LogDebug(BCLog::NET, "proxymode: relaying block %s to peer=%d\n", hash.ToString(), node->GetId());
+            return true;
+        });
     }
 }
 
@@ -4892,6 +5043,7 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string
             }
         }
         ProcessBlock(pfrom, pblock, forceProcessing, min_pow_checked);
+        if (m_opts.proxy_mode) ServeProxiedBlock(hash, pblock);
         return;
     }
 

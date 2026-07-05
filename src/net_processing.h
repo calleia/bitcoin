@@ -50,6 +50,8 @@ static const unsigned int MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK = 3;
 static const unsigned int MAX_HEADERS_RESULTS = 2000;
 /** The compactblocks version we support. See BIP 152. */
 static constexpr uint64_t CMPCTBLOCKS_VERSION{2};
+/** Whether to fetch blocks requested by peers that we do not have (e.g. pruned) from the network and relay them back. */
+static constexpr bool DEFAULT_PROXY_MODE{false};
 
 struct CNodeStateStats {
     int nSyncHeight = -1;
@@ -95,6 +97,10 @@ public:
         uint32_t max_headers_result{MAX_HEADERS_RESULTS};
         //! Whether private broadcast is used for sending transactions.
         bool private_broadcast{DEFAULT_PRIVATE_BROADCAST};
+        //! Whether to fetch blocks requested by peers that we do not have
+        //! locally (e.g. due to pruning) from the network and relay them back
+        //! to the requesting peer.
+        bool proxy_mode{DEFAULT_PROXY_MODE};
     };
 
     static std::unique_ptr<PeerManager> make(CConnman& connman, AddrMan& addrman,
